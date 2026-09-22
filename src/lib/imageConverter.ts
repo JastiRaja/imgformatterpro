@@ -147,39 +147,104 @@ const encodeBmpBlob = (canvas: HTMLCanvasElement): Blob => {
 };
 
 /**
- * Encode canvas into an authentic Windows Icon (.ico) file wrapping PNG format.
+ * Encode canvas into an authentic Windows Icon (.ico) file using 32-bit DIB format (BGRA).
+ * This format is 100% compatible with Windows Photo Viewer, Microsoft Paint,
+ * Windows Explorer thumbnails, macOS Preview, and all web browsers.
  */
-const encodeIcoBlob = async (canvas: HTMLCanvasElement): Promise<Blob> => {
-  const pngBlob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Failed to encode ICO'))), 'image/png');
-  });
-  const pngBuffer = await pngBlob.arrayBuffer();
+const encodeIcoBlob = (canvas: HTMLCanvasElement): Blob => {
+  // Windows ICO format specification strictly limits dimensions to a maximum of 256x256 pixels.
+  let icoCanvas = canvas;
+  if (canvas.width > 256 || canvas.height > 256) {
+    const scale = Math.min(256 / canvas.width, 256 / canvas.height);
+    const targetW = Math.max(16, Math.round(canvas.width * scale));
+    const targetH = Math.max(16, Math.round(canvas.height * scale));
 
-  const width = Math.min(256, canvas.width);
-  const height = Math.min(256, canvas.height);
+    icoCanvas = document.createElement('canvas');
+    icoCanvas.width = targetW;
+    icoCanvas.height = targetH;
+    const ctx = icoCanvas.getContext('2d', { willReadFrequently: true });
+    if (ctx) {
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(canvas, 0, 0, targetW, targetH);
+    }
+  }
+
+  const width = icoCanvas.width;
+  const height = icoCanvas.height;
+  const ctx = icoCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('Failed to get 2D context for ICO encoding');
+
+  const imgData = ctx.getImageData(0, 0, width, height);
+  const { data } = imgData;
+
   const headerSize = 6;
-  const dirSize = 16;
-  const totalSize = headerSize + dirSize + pngBuffer.byteLength;
+  const dirEntrySize = 16;
+  const dibHeaderSize = 40;
+  const bpp = 32;
+  const rowSize = width * 4;
+  const pixelArraySize = rowSize * height;
+  const maskRowSize = Math.floor((width + 31) / 32) * 4;
+  const maskArraySize = maskRowSize * height;
+  const imageResourceSize = dibHeaderSize + pixelArraySize + maskArraySize;
+  const totalFileSize = headerSize + dirEntrySize + imageResourceSize;
 
-  const buffer = new ArrayBuffer(totalSize);
+  const buffer = new ArrayBuffer(totalFileSize);
   const view = new DataView(buffer);
 
-  // ICONDIR
-  view.setUint16(0, 0, true); // Reserved (0)
-  view.setUint16(2, 1, true); // Type (1 = ICO)
-  view.setUint16(4, 1, true); // Image count (1)
+  // ICONDIR header
+  view.setUint16(0, 0, true); // Reserved (must be 0)
+  view.setUint16(2, 1, true); // Resource Type (1 = ICO)
+  view.setUint16(4, 1, true); // Image count (1 image entry)
 
-  // ICONDIRENTRY
-  view.setUint8(6, width === 256 ? 0 : width);
-  view.setUint8(7, height === 256 ? 0 : height);
-  view.setUint8(8, 0); // Palette
+  // ICONDIRENTRY (16 bytes)
+  // In ICO spec: 0 specifies 256 pixels
+  view.setUint8(6, width >= 256 ? 0 : width);
+  view.setUint8(7, height >= 256 ? 0 : height);
+  view.setUint8(8, 0); // Palette color count (0 = no palette)
   view.setUint8(9, 0); // Reserved
-  view.setUint16(10, 1, true); // Color planes
-  view.setUint16(12, 32, true); // Bits per pixel
-  view.setUint32(14, pngBuffer.byteLength, true); // Bytes in resource
-  view.setUint32(18, headerSize + dirSize, true); // Offset of image data
+  view.setUint16(10, 1, true); // Color planes (1)
+  view.setUint16(12, bpp, true); // Bits per pixel (32-bit RGBA)
+  view.setUint32(14, imageResourceSize, true); // Resource size in bytes
+  view.setUint32(18, headerSize + dirEntrySize, true); // Offset of resource data (22)
 
-  new Uint8Array(buffer, headerSize + dirSize).set(new Uint8Array(pngBuffer));
+  // BITMAPINFOHEADER (DIB Header - 40 bytes)
+  const offset = 22;
+  view.setUint32(offset, 40, true); // biSize
+  view.setInt32(offset + 4, width, true); // biWidth
+  view.setInt32(offset + 8, height * 2, true); // biHeight MUST be height * 2 in ICO DIBs
+  view.setUint16(offset + 12, 1, true); // biPlanes
+  view.setUint16(offset + 14, bpp, true); // biBitCount (32)
+  view.setUint32(offset + 16, 0, true); // biCompression (0 = BI_RGB)
+  view.setUint32(offset + 20, pixelArraySize + maskArraySize, true); // biSizeImage
+  view.setInt32(offset + 24, 0, true); // biXPelsPerMeter
+  view.setInt32(offset + 28, 0, true); // biYPelsPerMeter
+  view.setUint32(offset + 32, 0, true); // biClrUsed
+  view.setUint32(offset + 36, 0, true); // biClrImportant
+
+  // Pixel data: DIB stores pixels bottom-to-top, BGRA format
+  let writeOffset = 22 + dibHeaderSize;
+  const uint8 = new Uint8Array(buffer);
+
+  for (let y = height - 1; y >= 0; y--) {
+    for (let x = 0; x < width; x++) {
+      const srcIdx = (y * width + x) * 4;
+      const r = data[srcIdx];
+      const g = data[srcIdx + 1];
+      const b = data[srcIdx + 2];
+      const a = data[srcIdx + 3];
+
+      uint8[writeOffset++] = b;
+      uint8[writeOffset++] = g;
+      uint8[writeOffset++] = r;
+      uint8[writeOffset++] = a;
+    }
+  }
+
+  // 1-bit AND mask (all 0s because 32-bit alpha channel defines transparency)
+  for (let i = 0; i < maskArraySize; i++) {
+    uint8[writeOffset++] = 0;
+  }
 
   return new Blob([buffer], { type: 'image/x-icon' });
 };
@@ -204,7 +269,7 @@ const canvasToBlob = (
     return Promise.resolve(encodeBmpBlob(canvas));
   }
   if (format === 'ico') {
-    return encodeIcoBlob(canvas);
+    return Promise.resolve(encodeIcoBlob(canvas));
   }
   if (format === 'svg') {
     return Promise.resolve(encodeSvgBlob(canvas));
